@@ -30,28 +30,30 @@ use crate::{
 };
 
 use log::{debug, error, info, warn};
-#[cfg(not(feature = "integration"))]
-use std::io::stdout;
-use std::{io::stdin, path::Path, sync::Arc};
+use std::{
+    io::{stdin, IsTerminal},
+    path::Path,
+    sync::Arc,
+};
 
 #[cfg(not(windows))]
 use anyhow::Context;
 use anyhow::Error;
 
-use crossterm::{event::Event as CrosstermEvent, tty::IsTty};
+use termina::Event as TerminaEvent;
 #[cfg(not(windows))]
 use {signal_hook::consts::signal, signal_hook_tokio::Signals};
 #[cfg(windows)]
 type Signals = futures_util::stream::Empty<()>;
 
 #[cfg(not(feature = "integration"))]
-use tui::backend::CrosstermBackend;
+use tui::backend::TerminaBackend;
 
 #[cfg(feature = "integration")]
 use tui::backend::TestBackend;
 
 #[cfg(not(feature = "integration"))]
-type TerminalBackend = CrosstermBackend<std::io::Stdout>;
+type TerminalBackend = TerminaBackend;
 
 #[cfg(feature = "integration")]
 type TerminalBackend = TestBackend;
@@ -104,7 +106,7 @@ impl Application {
         let theme_loader = theme::Loader::new(&theme_parent_dirs);
 
         #[cfg(not(feature = "integration"))]
-        let backend = CrosstermBackend::new(stdout(), &config.editor);
+        let backend = TerminaBackend::new(config.editor.clone().into())?;
 
         #[cfg(feature = "integration")]
         let backend = TestBackend::new(120, 150);
@@ -214,7 +216,7 @@ impl Application {
             } else {
                 editor.new_file(Action::VerticalSplit);
             }
-        } else if stdin().is_tty() || cfg!(feature = "integration") {
+        } else if stdin().is_terminal() || cfg!(feature = "integration") {
             editor.new_file(Action::VerticalSplit);
         } else {
             editor
@@ -282,7 +284,7 @@ impl Application {
 
     pub async fn event_loop<S>(&mut self, input_stream: &mut S)
     where
-        S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+        S: Stream<Item = std::io::Result<TerminaEvent>> + Unpin,
     {
         self.render().await;
 
@@ -295,7 +297,7 @@ impl Application {
 
     pub async fn event_loop_until_idle<S>(&mut self, input_stream: &mut S) -> bool
     where
-        S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+        S: Stream<Item = std::io::Result<TerminaEvent>> + Unpin,
     {
         loop {
             if self.editor.should_close() {
@@ -500,7 +502,7 @@ impl Application {
                 // https://github.com/neovim/neovim/issues/12322
                 // https://github.com/neovim/neovim/pull/13084
                 for retries in 1..=10 {
-                    match self.claim_term().await {
+                    match self.terminal.claim() {
                         Ok(()) => break,
                         Err(err) if retries == 10 => panic!("Failed to claim terminal: {}", err),
                         Err(_) => continue,
@@ -624,7 +626,7 @@ impl Application {
         false
     }
 
-    pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermEvent>) {
+    pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminaEvent>) {
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,
@@ -632,9 +634,9 @@ impl Application {
         };
         // Handle key events
         let should_redraw = match event.unwrap() {
-            CrosstermEvent::Resize(width, height) => {
+            TerminaEvent::WindowResized { rows, cols } => {
                 self.terminal
-                    .resize(Rect::new(0, 0, width, height))
+                    .resize(Rect::new(0, 0, rows, cols))
                     .expect("Unable to resize terminal");
 
                 let area = self.terminal.size().expect("couldn't get terminal size");
@@ -642,11 +644,11 @@ impl Application {
                 self.compositor.resize(area);
 
                 self.compositor
-                    .handle_event(&Event::Resize(width, height), &mut cx)
+                    .handle_event(&Event::Resize(rows, cols), &mut cx)
             }
             // Ignore keyboard release events.
-            CrosstermEvent::Key(crossterm::event::KeyEvent {
-                kind: crossterm::event::KeyEventKind::Release,
+            TerminaEvent::Key(termina::event::KeyEvent {
+                kind: termina::event::KeyEventKind::Release,
                 ..
             }) => false,
             event => self.compositor.handle_event(&event.into(), &mut cx),
@@ -1088,36 +1090,34 @@ impl Application {
         lsp::ShowDocumentResult { success: true }
     }
 
-    async fn claim_term(&mut self) -> std::io::Result<()> {
-        let terminal_config = self.config.load().editor.clone().into();
-        self.terminal.claim(terminal_config)
-    }
-
     fn restore_term(&mut self) -> std::io::Result<()> {
-        let terminal_config = self.config.load().editor.clone().into();
         use helix_view::graphics::CursorKind;
         self.terminal
             .backend_mut()
             .show_cursor(CursorKind::Block)
             .ok();
-        self.terminal.restore(terminal_config)
+        self.terminal.restore()
+    }
+
+    #[cfg(not(feature = "integration"))]
+    pub fn event_stream(&self) -> impl Stream<Item = std::io::Result<TerminaEvent>> + Unpin {
+        use termina::Terminal as _;
+        self.terminal
+            .backend()
+            .terminal()
+            .event_stream(|event| !event.is_escape())
+    }
+
+    #[cfg(feature = "integration")]
+    pub fn event_stream(&self) -> impl Stream<Item = std::io::Result<TerminaEvent>> + Unpin {
+        termina::DummyEventStream
     }
 
     pub async fn run<S>(&mut self, input_stream: &mut S) -> Result<i32, Error>
     where
-        S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+        S: Stream<Item = std::io::Result<TerminaEvent>> + Unpin,
     {
-        self.claim_term().await?;
-
-        // Exit the alternate screen and disable raw mode before panicking
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            // We can't handle errors properly inside this closure.  And it's
-            // probably not a good idea to `unwrap()` inside a panic handler.
-            // So we just ignore the `Result`.
-            let _ = TerminalBackend::force_restore();
-            hook(info);
-        }));
+        self.terminal.claim()?;
 
         self.event_loop(input_stream).await;
 

@@ -4,19 +4,23 @@ use crate::{buffer::Cell, terminal::Config};
 
 use helix_view::graphics::{CursorKind, Rect};
 
+// TODO: remove
 #[cfg(feature = "crossterm")]
 mod crossterm;
+#[cfg(feature = "termina")]
+mod termina;
 #[cfg(feature = "crossterm")]
 pub use self::crossterm::CrosstermBackend;
+#[cfg(feature = "termina")]
+pub use self::termina::TerminaBackend;
 
 mod test;
 pub use self::test::TestBackend;
 
 pub trait Backend {
-    fn claim(&mut self, config: Config) -> Result<(), io::Error>;
+    fn claim(&mut self) -> Result<(), io::Error>;
     fn reconfigure(&mut self, config: Config) -> Result<(), io::Error>;
-    fn restore(&mut self, config: Config) -> Result<(), io::Error>;
-    fn force_restore() -> Result<(), io::Error>;
+    fn restore(&mut self) -> Result<(), io::Error>;
     fn draw<'a, I>(&mut self, content: I) -> Result<(), io::Error>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>;
